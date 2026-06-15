@@ -1,0 +1,482 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>????? ABR ????</title>
+<style>
+@page { size: A4; margin: 18mm 16mm; }
+body { font-family: "Microsoft YaHei", "SimSun", Arial, sans-serif; color: #222; font-size: 11.2pt; line-height: 1.65; }
+h1, h2, h3 { color: #111; page-break-after: avoid; }
+h1 { text-align: center; font-size: 22pt; margin: 0 0 18pt; }
+h2 { font-size: 16pt; border-bottom: 1px solid #ddd; padding-bottom: 4pt; margin-top: 20pt; }
+h3 { font-size: 13pt; margin-top: 14pt; }
+p { margin: 7pt 0; }
+table { border-collapse: collapse; width: 100%; margin: 10pt 0 14pt; font-size: 9.6pt; page-break-inside: avoid; }
+th, td { border: 1px solid #bbb; padding: 5pt 6pt; vertical-align: top; }
+th { background: #f1f3f5; font-weight: 700; }
+code { font-family: Consolas, "Courier New", monospace; font-size: 9.6pt; }
+pre { background: #f6f8fa; border: 1px solid #ddd; padding: 8pt; overflow: hidden; white-space: pre-wrap; page-break-inside: avoid; }
+img { display: block; max-width: 100%; max-height: 210mm; margin: 10pt auto 16pt; page-break-inside: avoid; }
+ul, ol { margin-top: 6pt; }
+li { margin: 3pt 0; }
+</style>
+</head>
+<body>
+<h1 id="abr">自适应码率 ABR 实验报告</h1>
+<h2 id="_1">一、实验目的</h2>
+<p>本实验围绕视频传输中的 Adaptive Bit-Rate（ABR）问题展开。实验目标是理解并实现基于缓冲区的 BBA 算法和基础的基于吞吐量预测的 RB 算法，在真实网络 trace 下比较二者在视频质量、卡顿时间、码率波动和 QoE reward 上的表现。同时，通过修改 BBA 的 <code>reservoir</code>、<code>cushion</code> 参数以及 reward 惩罚权重，分析不同参数对算法决策的影响。</p>
+<h2 id="_2">二、实验环境</h2>
+<p>实验环境如下：</p>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>操作系统</td>
+<td>Windows</td>
+</tr>
+<tr>
+<td>Python 版本</td>
+<td>Python 3.10.10</td>
+</tr>
+<tr>
+<td>依赖库</td>
+<td>numpy、matplotlib</td>
+</tr>
+<tr>
+<td>网络数据</td>
+<td><code>test_traces</code> 文件夹中的真实网络 trace</td>
+</tr>
+<tr>
+<td>视频数据</td>
+<td><code>video_size</code> 文件夹中的 6 档码率视频块大小</td>
+</tr>
+</tbody>
+</table>
+<p>本实验选取 3 条 trace 进行分析：</p>
+<table>
+<thead>
+<tr>
+<th>trace</th>
+<th>类型</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>norway_bus_1</code></td>
+<td>公交移动网络</td>
+</tr>
+<tr>
+<td><code>norway_car_1</code></td>
+<td>汽车移动网络</td>
+</tr>
+<tr>
+<td><code>norway_train_1</code></td>
+<td>火车移动网络</td>
+</tr>
+</tbody>
+</table>
+<p>运行命令示例：</p>
+<pre><code class="language-bash">python bba.py --reservoir 5 --cushion 10 --traces norway_bus_1 norway_car_1 norway_train_1 --summary-dir results_bba_r5_c10
+python rb.py --history-len 5 --safety-factor 0.9 --traces norway_bus_1 norway_car_1 norway_train_1 --summary-dir results_rb_h5_sf09
+python analyze_results.py --traces norway_bus_1 norway_car_1 norway_train_1 --result-dirs results_bba_r5_c10 results_rb_h5_sf09 --output-dir analysis_report
+</code></pre>
+<h2 id="_3">三、算法实现</h2>
+<h3 id="31-bba">3.1 BBA 算法</h3>
+<p>BBA（Buffer-Based Algorithm）根据客户端当前缓冲区大小选择下一视频块的码率。代码中使用两个核心参数：</p>
+<ul>
+<li><code>reservoir</code>：低缓冲区阈值。当 buffer 小于该值时，选择最低码率，优先避免卡顿。</li>
+<li><code>cushion</code>：线性增长区间。当 buffer 位于 <code>reservoir</code> 和 <code>reservoir + cushion</code> 之间时，根据 buffer 大小线性映射到不同码率。</li>
+</ul>
+<p>BBA 决策逻辑为：</p>
+<pre><code class="language-python">if buffer_size &lt; reservoir:
+    bit_rate = 0
+elif buffer_size &gt;= reservoir + cushion:
+    bit_rate = A_DIM - 1
+else:
+    bit_rate = (A_DIM - 1) * (buffer_size - reservoir) / cushion
+</code></pre>
+<p>缓冲区越高，BBA 越倾向于选择高码率；缓冲区越低，BBA 越保守。</p>
+<h3 id="32-rb">3.2 RB 算法</h3>
+<p>RB（Rate-Based）算法主要根据历史吞吐量预测未来带宽。本实验实现的基础 RB 使用最近 5 个视频块的实测吞吐量均值作为带宽预测值，并乘以安全系数 <code>0.9</code>，避免过于激进。</p>
+<p>吞吐量计算方式为：</p>
+<pre><code class="language-python">throughput_kbps = video_chunk_size * 8 / download_time / 1000
+</code></pre>
+<p>之后从可选码率集合 <code>[300, 750, 1200, 1850, 2850, 4300]</code> 中选择不超过预测带宽的最高码率。</p>
+<h3 id="33-qoe-reward">3.3 QoE Reward 公式</h3>
+<p>代码中的 reward 由三部分组成：</p>
+<pre><code class="language-python">reward = video_quality - rebuf_penalty * rebuffer_time - smooth_penalty * bitrate_change
+</code></pre>
+<p>对应含义如下：</p>
+<table>
+<thead>
+<tr>
+<th>组成部分</th>
+<th>含义</th>
+<th>影响</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>视频质量奖励</td>
+<td>当前视频块码率越高，奖励越高</td>
+<td>鼓励选择高清晰度</td>
+</tr>
+<tr>
+<td>卡顿惩罚</td>
+<td>卡顿时间越长，惩罚越大</td>
+<td>鼓励减少 rebuffer</td>
+</tr>
+<tr>
+<td>平滑惩罚</td>
+<td>相邻视频块码率差异越大，惩罚越大</td>
+<td>鼓励码率稳定</td>
+</tr>
+</tbody>
+</table>
+<p>默认参数为 <code>rebuf_penalty=4.3</code>、<code>smooth_penalty=1</code>。</p>
+<h2 id="trace">四、网络 Trace 统计分析</h2>
+<p>3 条 trace 的统计结果如下：</p>
+<table>
+<thead>
+<tr>
+<th>trace</th>
+<th style="text-align: right;">平均带宽 Mbps</th>
+<th style="text-align: right;">最大带宽 Mbps</th>
+<th style="text-align: right;">最小带宽 Mbps</th>
+<th style="text-align: right;">标准差</th>
+<th style="text-align: right;">变化幅度 Mbps</th>
+<th>突发下降</th>
+<th>剧烈波动</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>norway_bus_1</code></td>
+<td style="text-align: right;">3.337</td>
+<td style="text-align: right;">4.793</td>
+<td style="text-align: right;">0.375</td>
+<td style="text-align: right;">0.885</td>
+<td style="text-align: right;">4.418</td>
+<td>是</td>
+<td>否</td>
+</tr>
+<tr>
+<td><code>norway_car_1</code></td>
+<td style="text-align: right;">1.989</td>
+<td style="text-align: right;">4.342</td>
+<td style="text-align: right;">0.306</td>
+<td style="text-align: right;">1.005</td>
+<td style="text-align: right;">4.036</td>
+<td>是</td>
+<td>是</td>
+</tr>
+<tr>
+<td><code>norway_train_1</code></td>
+<td style="text-align: right;">1.586</td>
+<td style="text-align: right;">4.176</td>
+<td style="text-align: right;">0.261</td>
+<td style="text-align: right;">0.801</td>
+<td style="text-align: right;">3.915</td>
+<td>是</td>
+<td>是</td>
+</tr>
+</tbody>
+</table>
+<p>带宽变化曲线如下：</p>
+<p><img alt="norway_bus_1 带宽曲线" src="analysis_report/norway_bus_1_bandwidth.png" /></p>
+<p><img alt="norway_car_1 带宽曲线" src="analysis_report/norway_car_1_bandwidth.png" /></p>
+<p><img alt="norway_train_1 带宽曲线" src="analysis_report/norway_train_1_bandwidth.png" /></p>
+<p>从统计结果可以看出，<code>norway_bus_1</code> 平均带宽较高，虽然存在突发下降，但整体波动相对较低；<code>norway_car_1</code> 和 <code>norway_train_1</code> 平均带宽较低，且标准差相对平均值较高，属于更加不稳定的移动网络环境。</p>
+<h2 id="bba-rb">五、BBA 与 RB 对比实验</h2>
+<p>默认 BBA 参数为 <code>reservoir=5</code>、<code>cushion=10</code>。RB 参数为 <code>history_len=5</code>、<code>safety_factor=0.9</code>。</p>
+<table>
+<thead>
+<tr>
+<th>算法</th>
+<th>trace</th>
+<th style="text-align: right;">平均码率 Kbps</th>
+<th style="text-align: right;">总卡顿时间 s</th>
+<th style="text-align: right;">平均码率波动 Kbps</th>
+<th style="text-align: right;">总 reward</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>BBA</td>
+<td><code>norway_bus_1</code></td>
+<td style="text-align: right;">2624.49</td>
+<td style="text-align: right;">0.887</td>
+<td style="text-align: right;">947.92</td>
+<td style="text-align: right;">79.285</td>
+</tr>
+<tr>
+<td>BBA</td>
+<td><code>norway_car_1</code></td>
+<td style="text-align: right;">1421.43</td>
+<td style="text-align: right;">2.018</td>
+<td style="text-align: right;">403.12</td>
+<td style="text-align: right;">41.622</td>
+</tr>
+<tr>
+<td>BBA</td>
+<td><code>norway_train_1</code></td>
+<td style="text-align: right;">1039.80</td>
+<td style="text-align: right;">11.977</td>
+<td style="text-align: right;">375.00</td>
+<td style="text-align: right;">-18.553</td>
+</tr>
+<tr>
+<td>RB</td>
+<td><code>norway_bus_1</code></td>
+<td style="text-align: right;">2344.90</td>
+<td style="text-align: right;">7.558</td>
+<td style="text-align: right;">112.50</td>
+<td style="text-align: right;">77.002</td>
+</tr>
+<tr>
+<td>RB</td>
+<td><code>norway_car_1</code></td>
+<td style="text-align: right;">1353.06</td>
+<td style="text-align: right;">1.256</td>
+<td style="text-align: right;">146.88</td>
+<td style="text-align: right;">53.848</td>
+</tr>
+<tr>
+<td>RB</td>
+<td><code>norway_train_1</code></td>
+<td style="text-align: right;">777.55</td>
+<td style="text-align: right;">7.863</td>
+<td style="text-align: right;">93.75</td>
+<td style="text-align: right;">-0.211</td>
+</tr>
+</tbody>
+</table>
+<p>BBA 和 RB 的平均指标如下：</p>
+<table>
+<thead>
+<tr>
+<th>算法</th>
+<th style="text-align: right;">平均码率 Kbps</th>
+<th style="text-align: right;">平均总卡顿时间 s</th>
+<th style="text-align: right;">平均码率波动 Kbps</th>
+<th style="text-align: right;">平均总 reward</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>BBA</td>
+<td style="text-align: right;">1695.24</td>
+<td style="text-align: right;">4.961</td>
+<td style="text-align: right;">575.35</td>
+<td style="text-align: right;">34.118</td>
+</tr>
+<tr>
+<td>RB</td>
+<td style="text-align: right;">1491.84</td>
+<td style="text-align: right;">5.559</td>
+<td style="text-align: right;">117.71</td>
+<td style="text-align: right;">43.546</td>
+</tr>
+</tbody>
+</table>
+<p>结果表明，BBA 在 <code>norway_bus_1</code> 中表现较好。该 trace 平均带宽较高，BBA 能够利用较高 buffer 选择较高码率，因此平均码率和 reward 均较高。但在 <code>norway_train_1</code> 中，BBA 的卡顿时间达到 11.977 秒，导致 reward 为负。</p>
+<p>RB 在 <code>norway_car_1</code> 和 <code>norway_train_1</code> 中表现更好。由于 RB 直接根据历史吞吐量调整码率，在带宽下降时能够更快降低码率，因此卡顿时间和码率波动都更低。RB 的不足是平均码率偏低，在带宽较好的 <code>norway_bus_1</code> 中没有 BBA 激进，因此画质收益略低。</p>
+<p>BBA 与 RB 的曲线图见：</p>
+<ul>
+<li><code>analysis_report/bba_norway_bus_1_buffer.png</code></li>
+<li><code>analysis_report/bba_norway_bus_1_bitrate.png</code></li>
+<li><code>analysis_report/rb_norway_bus_1_buffer.png</code></li>
+<li><code>analysis_report/rb_norway_bus_1_bitrate.png</code></li>
+<li>其他 trace 的曲线同样保存在 <code>analysis_report</code> 文件夹中。</li>
+</ul>
+<h2 id="bba">六、BBA 参数影响分析</h2>
+<p>本实验比较 3 组 BBA 参数：</p>
+<table>
+<thead>
+<tr>
+<th>参数组</th>
+<th style="text-align: right;">reservoir</th>
+<th style="text-align: right;">cushion</th>
+<th>策略倾向</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>激进</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">8</td>
+<td>更早升码率，更追求画质</td>
+</tr>
+<tr>
+<td>默认</td>
+<td style="text-align: right;">5</td>
+<td style="text-align: right;">10</td>
+<td>平衡画质与卡顿</td>
+</tr>
+<tr>
+<td>保守</td>
+<td style="text-align: right;">10</td>
+<td style="text-align: right;">20</td>
+<td>更晚升码率，更重视稳定</td>
+</tr>
+</tbody>
+</table>
+<p>不同参数下的平均结果如下：</p>
+<table>
+<thead>
+<tr>
+<th>参数组</th>
+<th style="text-align: right;">平均码率 Kbps</th>
+<th style="text-align: right;">平均总卡顿时间 s</th>
+<th style="text-align: right;">平均码率波动 Kbps</th>
+<th style="text-align: right;">平均总 reward</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>BBA <code>r=2,c=8</code></td>
+<td style="text-align: right;">1874.49</td>
+<td style="text-align: right;">17.626</td>
+<td style="text-align: right;">610.07</td>
+<td style="text-align: right;">-13.224</td>
+</tr>
+<tr>
+<td>BBA <code>r=5,c=10</code></td>
+<td style="text-align: right;">1695.24</td>
+<td style="text-align: right;">4.961</td>
+<td style="text-align: right;">575.35</td>
+<td style="text-align: right;">34.118</td>
+</tr>
+<tr>
+<td>BBA <code>r=10,c=20</code></td>
+<td style="text-align: right;">1560.88</td>
+<td style="text-align: right;">3.336</td>
+<td style="text-align: right;">385.07</td>
+<td style="text-align: right;">43.657</td>
+</tr>
+</tbody>
+</table>
+<p>可以看出，较小的 <code>reservoir</code> 和 <code>cushion</code> 会让算法更激进，平均码率提高到 1874.49 Kbps，但平均卡顿时间增加到 17.626 秒，最终 reward 反而最低。较大的 <code>reservoir</code> 和 <code>cushion</code> 会让算法更保守，平均码率下降到 1560.88 Kbps，但卡顿和码率波动明显降低，平均 reward 最高。</p>
+<p>因此，在移动网络波动较强的场景下，保守参数更适合 BBA；在带宽稳定且 buffer 能够维持较高水平时，较激进参数可以提升视频质量。</p>
+<h2 id="reward">七、Reward 惩罚权重影响分析</h2>
+<p>本实验在 BBA 默认参数 <code>reservoir=5,cushion=10</code> 下修改 reward 权重：</p>
+<table>
+<thead>
+<tr>
+<th>设置</th>
+<th style="text-align: right;">rebuf_penalty</th>
+<th style="text-align: right;">smooth_penalty</th>
+<th style="text-align: right;">平均码率 Kbps</th>
+<th style="text-align: right;">平均总卡顿时间 s</th>
+<th style="text-align: right;">平均码率波动 Kbps</th>
+<th style="text-align: right;">平均总 reward</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>默认</td>
+<td style="text-align: right;">4.3</td>
+<td style="text-align: right;">1.0</td>
+<td style="text-align: right;">1695.24</td>
+<td style="text-align: right;">4.961</td>
+<td style="text-align: right;">575.35</td>
+<td style="text-align: right;">34.118</td>
+</tr>
+<tr>
+<td>增大卡顿惩罚</td>
+<td style="text-align: right;">6.0</td>
+<td style="text-align: right;">1.0</td>
+<td style="text-align: right;">1695.24</td>
+<td style="text-align: right;">4.961</td>
+<td style="text-align: right;">575.35</td>
+<td style="text-align: right;">25.684</td>
+</tr>
+<tr>
+<td>增大平滑惩罚</td>
+<td style="text-align: right;">4.3</td>
+<td style="text-align: right;">2.0</td>
+<td style="text-align: right;">1695.24</td>
+<td style="text-align: right;">4.961</td>
+<td style="text-align: right;">575.35</td>
+<td style="text-align: right;">6.501</td>
+</tr>
+</tbody>
+</table>
+<p>需要注意的是，在本实验代码中，reward 权重只用于计算 QoE 指标，不参与 BBA 决策。因此修改惩罚权重后，码率选择、卡顿时间和码率波动不变，但最终 reward 会发生变化。</p>
+<p>当 <code>rebuf_penalty</code> 从 4.3 增加到 6.0 时，存在卡顿的 trace reward 降低，尤其是 <code>norway_train_1</code> 下降明显。当 <code>smooth_penalty</code> 从 1.0 增加到 2.0 时，BBA 因为码率波动较大，平均 reward 从 34.118 降到 6.501。这说明 reward 公式会显著影响对算法优劣的评价标准。</p>
+<h2 id="_4">八、综合分析</h2>
+<p>BBA 的优势是实现简单，不需要显式预测网络带宽。当 buffer 较高时，BBA 可以大胆选择高码率，在平均带宽较高且波动较小的网络中能取得较高视频质量。其不足是对突发带宽下降不敏感，因为 BBA 只观察 buffer。当网络突然变差时，buffer 的下降具有滞后性，算法可能仍选择较高码率，从而导致卡顿。</p>
+<p>RB 的优势是能够直接感知下载吞吐量变化，在带宽下降时更快降低码率，因此在 <code>norway_car_1</code> 和 <code>norway_train_1</code> 这类波动较强的 trace 上卡顿更少、码率更平稳。其不足是依赖历史吞吐量预测，若预测窗口过短会受瞬时波动影响，预测窗口过长又会响应滞后；同时安全系数会让 RB 偏保守，导致平均码率低于 BBA。</p>
+<p>网络波动对 ABR 的影响主要体现在三个方面：</p>
+<ol>
+<li>带宽突降会导致下载时间增加，如果 buffer 不足，就会产生卡顿。</li>
+<li>带宽频繁波动会迫使算法频繁调整码率，增加质量波动惩罚。</li>
+<li>在低平均带宽 trace 中，高码率策略虽然短期提高画质，但更容易因为卡顿惩罚导致总 reward 降低。</li>
+</ol>
+<h2 id="_5">九、结论</h2>
+<p>本实验实现并比较了 BBA 与基础 RB 算法。实验结果表明，BBA 更适合平均带宽较高、buffer 能够保持充足的网络环境；RB 更适合带宽波动较大、突发下降明显的移动网络环境。</p>
+<p>在 BBA 参数方面，较激进的 <code>reservoir=2,cushion=8</code> 虽然提高了平均码率，但明显增加卡顿，最终 QoE 较差；较保守的 <code>reservoir=10,cushion=20</code> 降低了码率和波动，在本实验选取的 3 条移动 trace 上取得了最高平均 reward。</p>
+<p>在 reward 公式方面，视频质量、卡顿和码率波动之间存在明显权衡。卡顿惩罚越大，算法评价越偏向稳定播放；平滑惩罚越大，频繁升降码率的策略评价越低。因此，在实际 ABR 设计中，应根据业务需求合理设置 QoE 权重。</p>
+<h2 id="_6">十、提交文件说明</h2>
+<p>本次实验代码和结果文件包括：</p>
+<table>
+<thead>
+<tr>
+<th>文件或目录</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>bba.py</code></td>
+<td>可配置的 BBA 算法</td>
+</tr>
+<tr>
+<td><code>rb.py</code></td>
+<td>基础 RB 算法</td>
+</tr>
+<tr>
+<td><code>analyze_results.py</code></td>
+<td>统计分析和画图脚本</td>
+</tr>
+<tr>
+<td><code>fixed_env.py</code></td>
+<td>视频传输仿真环境</td>
+</tr>
+<tr>
+<td><code>load_trace.py</code></td>
+<td>trace 加载工具</td>
+</tr>
+<tr>
+<td><code>运行说明.md</code></td>
+<td>代码运行说明</td>
+</tr>
+<tr>
+<td><code>analysis_report</code></td>
+<td>实验统计表和曲线图</td>
+</tr>
+<tr>
+<td><code>results_bba_r5_c10</code></td>
+<td>默认 BBA 日志</td>
+</tr>
+<tr>
+<td><code>results_rb_h5_sf09</code></td>
+<td>RB 日志</td>
+</tr>
+<tr>
+<td><code>results_bba_r2_c8</code>、<code>results_bba_r10_c20</code></td>
+<td>BBA 参数实验日志</td>
+</tr>
+<tr>
+<td><code>results_bba_rebuf6</code>、<code>results_bba_smooth2</code></td>
+<td>reward 权重实验日志</td>
+</tr>
+</tbody>
+</table>
+</body>
+</html>
