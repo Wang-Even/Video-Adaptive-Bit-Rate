@@ -1,1 +1,0 @@
-# Video-Adaptive-Bit-Rate
